@@ -5,6 +5,23 @@
 . /lib/uboot-envtools.sh
 . /lib/functions.sh
 
+board=$(board_name)
+
+# W1700K boots through the HTTP-recovery chainloader U-Boot, which keeps a
+# redundant 0x4000 environment in the ubootenv/ubootenv2 UBI volumes. Older
+# images generated the generic 0x1f000 layout; drop those files so the exact
+# layout is regenerated below. This must run before the "preserve" block,
+# which would otherwise keep the stale files.
+case "$board" in
+gemtek,w1700k-ubi)
+	if [ -e /etc/config/ubootenv ] && [ -e /etc/fw_env.config ] &&
+		[ "$(grep -Ec '^/dev/ubi[0-9]+_[0-9]+[[:space:]]+0x0[[:space:]]+0x4000[[:space:]]+0x1f000[[:space:]]+1$' /etc/fw_env.config)" -eq 2 ]; then
+		exit 0
+	fi
+	rm -f /etc/config/ubootenv /etc/fw_env.config /etc/fw_sys.config
+	;;
+esac
+
 # Preserve customized UCI entries when only the generated file is missing.
 if [ -s /etc/config/ubootenv ]; then
 	[ -s /etc/fw_env.config ] && exit 0
@@ -14,8 +31,6 @@ if [ -s /etc/config/ubootenv ]; then
 fi
 
 touch /etc/config/ubootenv
-
-board=$(board_name)
 
 ubootenv_add_ubi_xr1710g() {
 	. /lib/upgrade/nand.sh
@@ -31,6 +46,10 @@ ubootenv_add_ubi_xr1710g() {
 	ubootenv_add_uci_config "$dev2" "0x0" "0x4000" "0x1f000" "1"
 }
 
+ubootenv_add_ubi_http_recovery() {
+	ubootenv_add_ubi_xr1710g
+}
+
 case "$board" in
 gemtek,xr1710g)
 	ubootenv_add_ubi_xr1710g
@@ -41,10 +60,12 @@ gemtek,xr1710g-ubi)
 gemtek,xg2010g-ubi|\
 gemtek,xg2010g-2g-ubi|\
 gemtek,xg2010g-2g|\
-gemtek,w1700k-ubi|\
 nokia,xg-040g-md-ubi|\
 nokia,xg-040g-tf-ubi)
 	ubootenv_add_ubi_default
+	;;
+gemtek,w1700k-ubi)
+	ubootenv_add_ubi_http_recovery
 	;;
 gemtek,xg2010g)
 	# The vendor partition table keeps the environment in the non-redundant
