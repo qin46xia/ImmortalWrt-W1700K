@@ -1,0 +1,117 @@
+#!/bin/sh
+#
+# W1700K: LAN-wide ad blocking with AdGuard Home, enabled out of the box.
+#
+#   clients --53--> AdGuard Home --> dnsmasq 127.0.0.1:54 --> WAN/ISP DNS
+#
+# dnsmasq moves to port 54 and keeps DHCP, local host names and its nftset
+# rules (proxy plugins keep working). AdGuard Home serves port 53 on all
+# addresses and forwards everything, including PTR lookups for the LAN, to
+# dnsmasq, so it sees every client by its own address.
+#
+# Runs before the package's own "adguardhome" uci-defaults, which then starts
+# the service because a configuration file exists.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+gemtek,w1700k-ubi) ;;
+*) exit 0 ;;
+esac
+
+[ -x /usr/bin/AdGuardHome ] || exit 0
+[ -f /etc/config/adguardhome ] || exit 0
+
+CONF=/etc/adguardhome/adguardhome.yaml
+
+# Applied once. A kept or user-supplied configuration always wins.
+[ "$(uci -q get adguardhome.config.w1700k_preset)" = 1 ] && exit 0
+[ -e "$CONF" ] && exit 0
+
+# Leave a dnsmasq that someone moved off port 53 on purpose alone.
+port="$(uci -q get dhcp.@dnsmasq[0].port)"
+[ -z "$port" ] || [ "$port" = 53 ] || exit 0
+
+mkdir -p /etc/adguardhome
+# Web UI: http://<router>:3000, user admin, password "password".
+# Change it right after the first login, see the AdGuard Home FAQ
+# ("How to reset the password") or replace the bcrypt hash below.
+cat > "$CONF" <<'EOF'
+http:
+  address: 0.0.0.0:3000
+users:
+  - name: admin
+    password: $2a$10$d9yRkSR3wpoj/7hjI/N7LOsynH86M8FF3Ww8Z//PN6B3AA5nz3CCm
+language: zh-cn
+theme: auto
+dns:
+  bind_hosts:
+    - '::'
+  port: 53
+  upstream_dns:
+    - 127.0.0.1:54
+  fallback_dns: []
+  local_ptr_upstreams:
+    - 127.0.0.1:54
+  use_private_ptr_resolvers: true
+  ratelimit: 0
+  cache_size: 4194304
+filtering:
+  protection_enabled: true
+  filtering_enabled: true
+filters:
+  - enabled: true
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+    name: AdGuard DNS filter
+    id: 1
+  - enabled: true
+    url: https://anti-ad.net/easylist.txt
+    name: anti-AD
+    id: 2
+querylog:
+  enabled: true
+  interval: 24h
+  size_memory: 1000
+statistics:
+  enabled: true
+  interval: 24h
+schema_version: 34
+EOF
+chown -R adguardhome:adguardhome /etc/adguardhome
+chmod 0700 /etc/adguardhome
+chmod 0600 "$CONF"
+
+uci -q batch <<'EOF'
+set adguardhome.config.enabled='1'
+set adguardhome.config.w1700k_preset='1'
+commit adguardhome
+EOF
+
+# dnsmasq: DNS on 54 for AdGuard Home only. It stops advertising itself as
+# DNS server once it is off port 53, so announce the router explicitly
+# (0.0.0.0 means "this dnsmasq host"). Its own port 53 hijack would now send
+# LAN queries past AdGuard Home; replace it with a DNAT to port 53.
+uci -q batch <<'EOF'
+set dhcp.@dnsmasq[0].port='54'
+set dhcp.@dnsmasq[0].dns_redirect='0'
+del_list dhcp.lan.dhcp_option='6,0.0.0.0'
+add_list dhcp.lan.dhcp_option='6,0.0.0.0'
+commit dhcp
+EOF
+
+if ! uci -q get firewall.adguardhome_dns >/dev/null; then
+	uci -q batch <<'EOF'
+set firewall.adguardhome_dns=redirect
+set firewall.adguardhome_dns.name='AdGuardHome-DNS-hijack'
+set firewall.adguardhome_dns.src='lan'
+set firewall.adguardhome_dns.proto='tcp udp'
+set firewall.adguardhome_dns.src_dport='53'
+set firewall.adguardhome_dns.dest_port='53'
+set firewall.adguardhome_dns.target='DNAT'
+commit firewall
+EOF
+fi
+
+/etc/init.d/adguardhome enable
+
+exit 0
