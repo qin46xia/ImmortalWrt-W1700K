@@ -54,6 +54,7 @@ known_device_model() {
 	case "$1" in
 		xg2010g)    printf 'XG2010G' ;;
 		xr1710g)    printf 'XR1710G' ;;
+		w1700k)     printf 'W1700K' ;;
 		xg-040g-md) printf 'XG-040G-MD' ;;
 		xg-040g-tf) printf 'XG-040G-TF' ;;
 		xg-040g-mf) printf 'XG-040G-MF' ;;
