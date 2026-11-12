@@ -3,9 +3,11 @@
 . /lib/functions/system.sh
 
 case "$(board_name)" in
-gemtek,xr1710g|gemtek,xr1710g-ubi|\
+gemtek,xr1710g|\
 gemtek,xg2010g|gemtek,xg2010g-ubi|gemtek,xg2010g-2g|gemtek,xg2010g-2g-ubi|\
 nokia,xg-040g-md|nokia,xg-040g-md-ubi|nokia,xg-040g-tf-ubi) ;;
+# gemtek,w1700k-ubi and gemtek,xr1710g-ubi are handled by
+# 20-airoha-firewall-defaults-v2, which also covers the dumb-AP case.
 *) exit 0 ;;
 esac
 
