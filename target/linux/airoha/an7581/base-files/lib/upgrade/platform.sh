@@ -28,6 +28,25 @@ airoha_require_ubi_layout()
 	}
 }
 
+# Clean UBI installs do not persist OpenWrt's generic compat_version marker,
+# so judge upgrade safety from the live flash layout. Old BMT/BBT layouts
+# must never be written by a normal sysupgrade.
+w1700k_mtd_size_is()
+{
+	awk -v label="$1" -v expected="$2" '
+		$4 == "\"" label "\"" && tolower($2) == expected { found = 1 }
+		END { exit(found ? 0 : 1) }
+	' /proc/mtd 2>/dev/null
+}
+
+w1700k_ubi_layout_check()
+{
+	w1700k_mtd_size_is vendor 00600000 &&
+	w1700k_mtd_size_is chainloader 00100000 &&
+	w1700k_mtd_size_is ubi 1b700000 &&
+	w1700k_mtd_size_is reserved_bmt 04200000
+}
+
 nokia_initial_setup()
 {
 	[ "$(rootfs_type)" = "tmpfs" ] || return 0
@@ -51,6 +70,15 @@ platform_check_image() {
 	gemtek,xr1710g-ubi)
 		gemtek_ubi_layout_check "$board" || {
 			echo "Unsupported Gemtek UBI layout; refusing sysupgrade."
+			return 1
+		}
+		fit_check_image "$1"
+		return $?
+		;;
+	gemtek,w1700k-ubi)
+		w1700k_ubi_layout_check || {
+			echo "W1700K UBI 2.0 boundaries are not active; refusing normal sysupgrade."
+			echo "Install the corrected chainloader/U-Boot and recreate UBI through recovery first."
 			return 1
 		}
 		fit_check_image "$1"

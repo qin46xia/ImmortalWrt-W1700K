@@ -5,7 +5,7 @@ Upstream-Status: Submitted [PR head 50ecba6b7714358869525a2f80047237c13a2691]
 diff --git a/npu.c b/npu.c
 --- a/npu.c
 +++ b/npu.c
-@@ -40,6 +40,11 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+@@ -40,6 +40,11 @@ int mt76_npu_fill_rx_queue(struct mt76_d
  		nframes++;
  	}
  
@@ -17,7 +17,7 @@ diff --git a/npu.c b/npu.c
  	return nframes;
  }
  
-@@ -67,19 +72,31 @@ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+@@ -67,19 +72,31 @@ static struct sk_buff *mt76_npu_dequeue(
  	int i, nframes, index = q->tail;
  	struct sk_buff *skb = NULL;
  
@@ -51,11 +51,10 @@ diff --git a/npu.c b/npu.c
 -			return NULL;
 -		}
 -
-+
  		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
  					e->dma_len[0],
  					page_pool_get_dma_dir(q->page_pool));
-@@ -108,7 +125,6 @@ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+@@ -108,7 +125,6 @@ static struct sk_buff *mt76_npu_dequeue(
  	}
  	q->tail = index;
  	q->queued -= i;
