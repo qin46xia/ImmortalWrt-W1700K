@@ -65,7 +65,7 @@ filters:
     name: AdGuard DNS filter
     id: 1
   - enabled: true
-    url: https://anti-ad.net/easylist.txt
+    url: https://fastly.jsdelivr.net/gh/privacy-protection-tools/anti-AD@master/anti-ad-easylist.txt
     name: anti-AD
     id: 2
 querylog:
