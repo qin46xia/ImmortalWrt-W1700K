@@ -1,0 +1,233 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: decrypt PPE-bound inbound SAs to the CPU
+
+An inbound SOE PPE entry matches the outer ESP 3-tuple, so it covers the
+whole SA. Forwarding its plaintext to the next hop of one inner flow
+breaks every other flow of the SA (see the previous patch). Point the
+entry at CDM1 instead: PPE and SOE then authenticate, decrypt and
+decapsulate the SA inline and the CPU receives plaintext.
+
+Such frames carry the decrypted hop flag but not the header the CPU
+submit path pushes, and SW_UDF holds the SA index (the entry ACTDP).
+Treat them as decrypted XFRM input: attach the SA to a secpath, account
+the state lifetime and pass them to the stack, which runs the inbound
+policy check, conntrack and forwarding for every inner flow. SOE enforces
+the replay window. This removes the CPU round trip of resubmitting each
+ESP packet to SOE and collecting its completion.
+
+soe_ppe_input: 0 keeps inbound SAs off PPE, 1 (default) decrypts to the
+CPU, 2 restores forwarding to the next hop for experiments.
+
+Clear the inherited PSE_QOS, FAST_PATH, MULTICAST and NBQ bits when
+retargeting to CDM1. They route the frame through the QDMA hardware
+forwarding QoS queues, whose descriptors are never released towards
+CDM1, starving QDMA TX on every port within a few hundred packets.
+
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c |  40 +++++++--
+ drivers/net/ethernet/airoha/airoha_soe.c | 102 ++++++++++++++++++++++-
+ 2 files changed, 132 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 256f5ce..429576e 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -41,14 +41,19 @@ module_param(ppe_bind_rate, int, 0644);
+ MODULE_PARM_DESC(ppe_bind_rate, "PPE bind threshold in packets per second (default 30)");
+ 
+ /* A bound inbound SOE entry can only match the outer ESP 3-tuple, so it
+- * takes over every packet of the SA: other inner flows, ICMP and traffic
+- * for the router itself are decrypted and sent to the first flow's next
+- * hop, bypassing conntrack (replies then hit ct state invalid). Keep
+- * inbound decryption on the SOE CPU path unless explicitly enabled.
++ * takes over every packet of the SA. Forwarding them to the next hop of
++ * the first offloaded inner flow (mode 2) sends other inner flows, ICMP
++ * and traffic for the router to the wrong place and bypasses conntrack.
++ * Mode 1 (default) lets PPE and SOE decrypt the SA inline and delivers
++ * the plaintext to the CPU, which then forwards every inner flow normally.
+  */
+-static bool soe_ppe_input;
+-module_param(soe_ppe_input, bool, 0644);
+-MODULE_PARM_DESC(soe_ppe_input, "Bind inbound SOE flows in PPE (takes over the whole SA)");
++#define AIROHA_PPE_SOE_INPUT_OFF	0
++#define AIROHA_PPE_SOE_INPUT_CPU	1
++#define AIROHA_PPE_SOE_INPUT_FORWARD	2
++static int soe_ppe_input = AIROHA_PPE_SOE_INPUT_CPU;
++module_param(soe_ppe_input, int, 0644);
++MODULE_PARM_DESC(soe_ppe_input,
++		 "Inbound SOE PPE binding: 0 off, 1 decrypt to CPU (default), 2 forward to next hop");
+ 
+ static void airoha_ppe_drop_inc(struct airoha_ppe *ppe,
+ 				enum airoha_ppe_drop_reason reason)
+@@ -996,7 +1001,8 @@ airoha_ppe_soe_flow_add(struct airoha_eth *eth,
+ 		return -ENOENT;
+ 	if (tuple->l3proto != NFPROTO_IPV4 || x->props.family != AF_INET)
+ 		return -EOPNOTSUPP;
+-	if (dir == XFRM_DEV_OFFLOAD_IN && !READ_ONCE(soe_ppe_input))
++	if (dir == XFRM_DEV_OFFLOAD_IN &&
++	    READ_ONCE(soe_ppe_input) == AIROHA_PPE_SOE_INPUT_OFF)
+ 		return -EOPNOTSUPP;
+ 
+ 	err = airoha_soe_ppe_flow_add(eth->soe, x, dir,
+@@ -2663,6 +2669,24 @@ airoha_ppe_foe_flow_commit_soe_in(struct airoha_ppe *ppe,
+ 	err = airoha_ppe_foe_entry_set_soe_fields(&entry, info);
+ 	if (err)
+ 		goto unlock;
++	if (READ_ONCE(soe_ppe_input) != AIROHA_PPE_SOE_INPUT_FORWARD) {
++		/* Deliver the decrypted SA to the CPU (CDM1). The RX path
++		 * recognises it by the decrypted hop flag without the SOE
++		 * submit header and reads the SA index from SW_UDF.
++		 *
++		 * The inherited egress ib2 routes through the QDMA hardware
++		 * forwarding QoS queues (PSE_QOS/FAST_PATH). Towards CDM1 those
++		 * descriptors are never released and starve QDMA TX on every
++		 * port, so deliver straight to the CDM1 output queue instead.
++		 */
++		entry.ipv4.ib2 &= ~(AIROHA_FOE_IB2_PSE_PORT |
++				    AIROHA_FOE_IB2_PSE_QOS |
++				    AIROHA_FOE_IB2_FAST_PATH |
++				    AIROHA_FOE_IB2_MULTICAST |
++				    AIROHA_FOE_IB2_NBQ);
++		entry.ipv4.ib2 |= FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
++					     FE_PSE_PORT_CDM1);
++	}
+ 
+ 	memcpy(&e->data, &entry, sizeof(e->data));
+ 	e->type = FLOW_TYPE_L4;
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index eb7fece..3ff225a 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -2279,6 +2279,12 @@ static int airoha_soe_prepare_ip_headers(struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++static bool airoha_soe_is_submit_header(const void *data)
++{
++	return !memcmp(data, airoha_soe_ipv4_l2_header, ETH_HLEN) ||
++	       !memcmp(data, airoha_soe_ipv6_l2_header, ETH_HLEN);
++}
++
+ bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0)
+ {
+ 	u32 hop_flags = FIELD_GET(QDMA_ETH_RXMSG_HOP_FLAGS_MASK, msg0);
+@@ -2287,8 +2293,13 @@ bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0)
+ 	    hop_flags > QDMA_ETH_RXMSG_HOP_ERROR_LAST || len < ETH_HLEN)
+ 		return false;
+ 
+-	return !memcmp(data, airoha_soe_ipv4_l2_header, ETH_HLEN) ||
+-	       !memcmp(data, airoha_soe_ipv6_l2_header, ETH_HLEN);
++	/* PPE-bound inbound SAs deliver decrypted plaintext without the
++	 * header the CPU submit path pushes.
++	 */
++	if (hop_flags == AIROHA_SOE_HOP_FLAG_DECRYPTED)
++		return true;
++
++	return airoha_soe_is_submit_header(data);
+ }
+ 
+ static int airoha_soe_push_l2_header(struct sk_buff *skb)
+@@ -3212,6 +3223,89 @@ drop:
+ 	kfree_skb(skb);
+ }
+ 
++/* Plaintext of an inbound SA bound in PPE: PPE matched the outer ESP
++ * 3-tuple, SOE authenticated, decrypted and decapsulated it, and PSE
++ * delivered it to the CPU with the SA index in SW_UDF. Hand it to the stack
++ * as if the XFRM input path had decrypted it, so conntrack, the firewall
++ * and the inbound policy check see every inner flow.
++ */
++static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
++				 unsigned int sa_index)
++{
++	struct net_device *netdev;
++	struct airoha_soe_sa *sa;
++	struct xfrm_offload *xo;
++	struct xfrm_state *x;
++	struct sec_path *sp;
++	__be16 protocol;
++	int err;
++
++	if (sa_index >= AIROHA_SOE_NUM_SA)
++		goto drop;
++
++	rcu_read_lock();
++	sa = rcu_dereference(soe->sa[sa_index]);
++	x = sa ? READ_ONCE(sa->x) : NULL;
++	if (!x || sa->dead || x->xso.dir != XFRM_DEV_OFFLOAD_IN ||
++	    !x->xso.dev || !refcount_inc_not_zero(&x->refcnt)) {
++		rcu_read_unlock();
++		goto drop;
++	}
++	netdev = x->xso.dev;
++	rcu_read_unlock();
++
++	if (!pskb_may_pull(skb, ETH_HLEN + sizeof(struct iphdr)))
++		goto put_state;
++
++	skb->dev = netdev;
++	skb_reset_mac_header(skb);
++	protocol = eth_hdr(skb)->h_proto;
++	ether_addr_copy(eth_hdr(skb)->h_dest, netdev->dev_addr);
++	skb_pull(skb, ETH_HLEN);
++	skb->protocol = protocol;
++	skb->pkt_type = PACKET_HOST;
++	skb_reset_mac_len(skb);
++
++	err = airoha_soe_prepare_ip_headers(skb);
++	if (err)
++		goto put_state;
++
++	skb->ip_summed = CHECKSUM_NONE;
++	skb->encapsulation = 0;
++	skb->mark = xfrm_smark_get(skb->mark, x);
++
++	/* SOE enforces the replay window for PPE-bound SAs. */
++	spin_lock_bh(&x->lock);
++	if (unlikely(x->km.state != XFRM_STATE_VALID) ||
++	    xfrm_state_check_expire(x)) {
++		spin_unlock_bh(&x->lock);
++		goto put_state;
++	}
++	x->curlft.bytes += skb->len;
++	x->curlft.packets++;
++	x->lastused = ktime_get_real_seconds();
++	spin_unlock_bh(&x->lock);
++
++	sp = secpath_set(skb);
++	if (!sp || sp->len >= XFRM_MAX_DEPTH)
++		goto put_state;
++	xo = &sp->ovec[0];
++	xo->flags = 0;
++	sp->xvec[sp->len++] = x;
++
++	nf_reset_ct(skb);
++	skb_clear_hash(skb);
++	netif_receive_skb(skb);
++
++	return true;
++
++put_state:
++	xfrm_state_put(x);
++drop:
++	kfree_skb(skb);
++	return true;
++}
++
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 		       unsigned int completion_tag, u32 hop_flags)
+ {
+@@ -3225,6 +3319,10 @@ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 
+ 	if (!soe || !skb || completion_tag > U8_MAX)
+ 		return false;
++	if (hop_flags == AIROHA_SOE_HOP_FLAG_DECRYPTED &&
++	    (skb_headlen(skb) < ETH_HLEN ||
++	     !airoha_soe_is_submit_header(skb->data)))
++		return airoha_soe_rx_ppe_in(soe, skb, completion_tag & 0x3f);
+ 	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
+ 	untracked = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+ 			      completion_tag) ==
+-- 
+2.43.0
+
