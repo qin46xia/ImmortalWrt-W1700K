@@ -1,0 +1,116 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: fix lost bind_tx wakeup, export SOE state
+
+bind_tx_work takes a deferred context off the queue before submitting it.
+If the submit fails with -EAGAIN because every completion slot is busy and
+those completions arrive meanwhile, active_ctx_sub() sees an empty queue and
+does not reschedule the work. bind_tx_draining then stays set, every later
+outbound packet is deferred, and SOE transmit stalls until the SA is
+reinstalled. Retry when nothing is left in flight.
+
+Also export per-SA in-flight state as the read-only soe_state parameter.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 408e2b8..e1eab17 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -25,6 +25,7 @@
+ #include <linux/io.h>
+ #include <linux/ipv6.h>
+ #include <linux/list.h>
++#include <linux/moduleparam.h>
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
+@@ -36,6 +37,7 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/string.h>
++#include <linux/sysfs.h>
+ #include <linux/udp.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+@@ -346,6 +348,53 @@ static LIST_HEAD(airoha_soe_list);
+ static DEFINE_MUTEX(airoha_soe_list_lock);
+ static unsigned int airoha_soe_list_users;
+ 
++static int airoha_soe_state_get(char *buf, const struct kernel_param *kp)
++{
++	struct airoha_soe *soe;
++	int len = 0, i;
++
++	mutex_lock(&airoha_soe_list_lock);
++	list_for_each_entry(soe, &airoha_soe_list, list) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&soe->seq_lock, flags);
++		len += sysfs_emit_at(buf, len,
++				     "active=%d queued=%d bind_tx_queued=%u draining=%d bind_active=%d seq_stopped=%d faulted=%d dead=%d\n",
++				     atomic_read(&soe->active_ctx),
++				     atomic_read(&soe->queued_ctx),
++				     soe->bind_tx_queued, soe->bind_tx_draining,
++				     soe->ppe_bind_active, soe->seq_stopped,
++				     soe->faulted, soe->dead);
++		spin_unlock_irqrestore(&soe->seq_lock, flags);
++		rcu_read_lock();
++		for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++			struct airoha_soe_sa *sa = rcu_dereference(soe->sa[i]);
++
++			if (!sa)
++				continue;
++			spin_lock_irqsave(&sa->lock, flags);
++			len += sysfs_emit_at(buf, len,
++					     " sa%u spi=%08x inflight=%u seq_map=%02lx tx=%zu rx=%zu dead=%d\n",
++					     sa->index,
++					     sa->x ? ntohl(sa->x->id.spi) : 0,
++					     sa->inflight, sa->completion_seq_map,
++					     list_count_nodes(&sa->tx_queue),
++					     list_count_nodes(&sa->rx_queue),
++					     sa->dead);
++			spin_unlock_irqrestore(&sa->lock, flags);
++		}
++		rcu_read_unlock();
++	}
++	mutex_unlock(&airoha_soe_list_lock);
++
++	return len;
++}
++
++static const struct kernel_param_ops airoha_soe_state_ops = {
++	.get = airoha_soe_state_get,
++};
++module_param_cb(soe_state, &airoha_soe_state_ops, NULL, 0444);
++
+ static const struct xfrmdev_ops airoha_soe_xfrmdev_ops;
+ static const struct xfrmdev_ops airoha_soe_dsa_xfrmdev_ops;
+ static void airoha_soe_detach_queued_ctx(struct airoha_soe_sa *sa,
+@@ -2557,6 +2606,8 @@ static void airoha_soe_bind_tx_work(struct work_struct *work)
+ {
+ 	struct airoha_soe *soe =
+ 		container_of(work, struct airoha_soe, bind_tx_work);
++	unsigned int retries = 0;
++	bool retry;
+ 
+ 	for (;;) {
+ 		struct airoha_gdm_dev *dev;
+@@ -2602,7 +2653,20 @@ static void airoha_soe_bind_tx_work(struct work_struct *work)
+ 			list_add(&ctx->list, &soe->bind_tx_queue);
+ 			soe->bind_tx_queued++;
+ 			soe->bind_tx_draining = true;
++			/* Completions which freed a slot while this context was
++			 * off the queue saw it empty and did not reschedule us.
++			 * With nothing left in flight no completion will, so
++			 * retry instead of stalling every later transmit.
++			 */
++			retry = !atomic_read(&soe->active_ctx) &&
++				!soe->ppe_bind_active && !soe->seq_stopped;
+ 			spin_unlock_irqrestore(&soe->seq_lock, flags);
++			if (retry && ++retries < 16) {
++				cond_resched();
++				continue;
++			}
++			if (retry)
++				schedule_work(&soe->bind_tx_work);
+ 			return;
+ 		}
+ 

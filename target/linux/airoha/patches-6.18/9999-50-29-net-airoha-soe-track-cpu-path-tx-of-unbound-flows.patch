@@ -1,0 +1,62 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: track CPU-path TX of unbound flows
+
+Every outbound TCP/UDP packet was submitted to SOE with the reserved
+"untracked" completion tag as soon as its 5-tuple could be parsed. On the
+W1700K (AN7581) the ESP packets SOE returns for such submits carry a wrong
+AES-GCM ICV, while the ciphertext itself is correct, so the peer drops
+every TCP/UDP packet (XfrmInStateProtoError) and only ICMP passes.
+
+The untracked tag is meant for CPU-path packets that raced with a bound
+PPE entry, which consumes their SOE result. Use it only when the SA has a
+bound outbound PPE flow for the packet's 5-tuple, and track every other
+packet like ICMP.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 4f78c4d..34a9989 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -2333,6 +2333,33 @@ airoha_soe_defer_tx_locked(struct airoha_soe_sa *sa,
+ 	return 0;
+ }
+ 
++/* A bound PPE entry consumes SOE results for its flow, so only CPU-path
++ * packets of such a flow may use the untracked completion tag. Every other
++ * packet is tracked: on EN7581 the encrypted result of an untracked submit
++ * carries an ICV that the peer rejects.
++ */
++static bool
++airoha_soe_sa_flow_bound_locked(struct airoha_soe_sa *sa,
++				const struct airoha_soe_ppe_flow_key *key)
++{
++	struct airoha_soe_ppe_flow *flow;
++
++	lockdep_assert_held(&sa->lock);
++
++	list_for_each_entry(flow, &sa->ppe_flows, sa_node) {
++		if (!flow->bound || !flow->key_valid || flow->input)
++			continue;
++		if (flow->key.saddr == key->saddr &&
++		    flow->key.daddr == key->daddr &&
++		    flow->key.sport == key->sport &&
++		    flow->key.dport == key->dport &&
++		    flow->key.l4proto == key->l4proto)
++			return true;
++	}
++
++	return false;
++}
++
+ static int
+ airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 			       struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -2377,7 +2404,8 @@ airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 		spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+ 		return -ENOENT;
+ 	}
+-	untracked = ctx->dir == AIROHA_SOE_CTX_OUT && ctx->tx.ppe_key_valid;
++	untracked = ctx->dir == AIROHA_SOE_CTX_OUT && ctx->tx.ppe_key_valid &&
++		    airoha_soe_sa_flow_bound_locked(sa, &ctx->tx.ppe_key);
+ 	if (ctx->dir == AIROHA_SOE_CTX_OUT &&
+ 	    (sa->soe->ppe_bind_active ||
+ 	     (!from_queue && sa->soe->bind_tx_draining))) {

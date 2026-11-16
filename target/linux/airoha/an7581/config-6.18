@@ -225,6 +225,7 @@ CONFIG_NET_AIROHA=y
 # CONFIG_AIROHA_PON_COMPAT is not set
 CONFIG_NET_AIROHA_FLOW_STATS=y
 CONFIG_NET_AIROHA_NPU=y
+CONFIG_NET_AIROHA_SOE=y
 # --- Bridge flowtable offload (bridged PPPoE / L2B into the Airoha PPE) ---
 # The generic config ships these off (its defaults are the most conservative
 # across all targets). Without them the bridge-family flowtable fw4 can build

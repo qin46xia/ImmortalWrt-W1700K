@@ -1,0 +1,62 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: add debug knobs for in-flight limit and seq allocation
+
+Runtime knobs (/sys/module/airoha_eth/parameters/) to isolate AES-GCM ICV
+corruption of SOE encrypt results under load: soe_max_inflight limits the
+tracked contexts per SA, soe_seq_rr allocates completion slots round-robin.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 34a9989..408e2b8 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -172,6 +172,14 @@
+ #define AIROHA_SOE_COMPLETION_SEQ_MASK GENMASK(7, 5)
+ #define AIROHA_SOE_COMPLETION_SEQ_UNTRACKED 7
+ #define AIROHA_SOE_COMPLETION_SEQ_COUNT 7
++
++/* Debug knobs for isolating SOE encrypt corruption under load. */
++static unsigned int soe_max_inflight = AIROHA_SOE_COMPLETION_SEQ_COUNT;
++module_param(soe_max_inflight, uint, 0644);
++MODULE_PARM_DESC(soe_max_inflight, "Max tracked SOE contexts in flight per SA (1-7)");
++static bool soe_seq_rr;
++module_param(soe_seq_rr, bool, 0644);
++MODULE_PARM_DESC(soe_seq_rr, "Allocate SOE completion sequence slots round-robin");
+ #define AIROHA_SOE_BIND_TX_MAX 1024
+ #define AIROHA_SOE_NATT_PORT 4500
+ 
+@@ -241,6 +249,7 @@ struct airoha_soe_sa {
+ 	struct completion idle;
+ 	unsigned int inflight;
+ 	unsigned long completion_seq_map;
++	unsigned int last_seq;
+ 	struct airoha_soe_ppe_key ppe_key;
+ 	bool hw_cleared;
+ 	bool quarantined;
+@@ -2431,8 +2440,25 @@ airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK,
+ 				   AIROHA_SOE_COMPLETION_SEQ_UNTRACKED);
+ 	} else {
+-		seq = find_first_zero_bit(&sa->completion_seq_map,
+-					  AIROHA_SOE_COMPLETION_SEQ_COUNT);
++		unsigned int limit = clamp_t(unsigned int,
++					     READ_ONCE(soe_max_inflight), 1,
++					     AIROHA_SOE_COMPLETION_SEQ_COUNT);
++
++		if (hweight_long(sa->completion_seq_map) >= limit) {
++			seq = AIROHA_SOE_COMPLETION_SEQ_COUNT;
++		} else if (READ_ONCE(soe_seq_rr)) {
++			seq = find_next_zero_bit(&sa->completion_seq_map,
++						 AIROHA_SOE_COMPLETION_SEQ_COUNT,
++						 sa->last_seq + 1);
++			if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT)
++				seq = find_first_zero_bit(&sa->completion_seq_map,
++							  AIROHA_SOE_COMPLETION_SEQ_COUNT);
++		} else {
++			seq = find_first_zero_bit(&sa->completion_seq_map,
++						  AIROHA_SOE_COMPLETION_SEQ_COUNT);
++		}
++		if (seq < AIROHA_SOE_COMPLETION_SEQ_COUNT)
++			sa->last_seq = seq;
+ 		if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT) {
+ 			if (ctx->dir == AIROHA_SOE_CTX_OUT && !from_queue)
+ 				err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx,
