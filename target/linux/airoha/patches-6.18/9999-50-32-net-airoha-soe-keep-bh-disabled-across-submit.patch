@@ -1,0 +1,63 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: keep BH disabled across SOE submit
+
+airoha_qdma_xmit_skb() releases the QDMA queue lock with spin_unlock_bh().
+When an SOE submit runs in process context, e.g. bind_tx_work draining
+deferred transmits under load, it holds seq_lock and sa->lock at that
+point, so pending softirqs run right there. RX forwarding then re-enters
+xfrm_dev_offload_ok() on the same CPU and spins on the held lock forever:
+
+  rcu: INFO: rcu_sched self-detected stall on CPU
+  Workqueue: events airoha_soe_bind_tx_work
+  queued_spin_lock_slowpath
+  xfrm_dev_offload_ok / xfrm_output / ip_forward ... net_rx_action
+  __local_bh_enable_ip
+  airoha_qdma_xmit_skb
+  airoha_soe_submit_prepared_skb
+  airoha_soe_bind_tx_work
+
+The CPU hangs and all routing stops while userspace keeps feeding the
+watchdog. Disable bottom halves across the whole submit.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index e1eab17..6433f71 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -2419,7 +2419,7 @@ airoha_soe_sa_flow_bound_locked(struct airoha_soe_sa *sa,
+ }
+ 
+ static int
+-airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
++__airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 			       struct airoha_gdm_dev *dev, struct sk_buff *skb,
+ 			       struct airoha_soe_ctx *ctx, struct xfrm_state *x,
+ 			       bool from_queue)
+@@ -2557,6 +2557,28 @@ airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 	return err;
+ }
+ 
++/* dev->soe_xmit_skb() drops the QDMA queue lock with spin_unlock_bh().
++ * Called from process context (bind_tx_work, local output) while holding
++ * seq_lock and sa->lock, that would run pending softirqs right here; RX
++ * forwarding then re-enters the XFRM offload path on this CPU and spins on
++ * the locks we hold. Keep bottom halves disabled across the submit.
++ */
++static int
++airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
++			       struct airoha_gdm_dev *dev, struct sk_buff *skb,
++			       struct airoha_soe_ctx *ctx, struct xfrm_state *x,
++			       bool from_queue)
++{
++	int err;
++
++	local_bh_disable();
++	err = __airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x,
++					       from_queue);
++	local_bh_enable();
++
++	return err;
++}
++
+ static int airoha_soe_submit_skb(struct airoha_soe_sa *sa,
+ 				 struct airoha_gdm_dev *dev,
+ 				 struct sk_buff *skb,

@@ -13,10 +13,14 @@ extends the same TCP validation block for XFRM/SOE flows.
 
 Signed-off-by: Bohdan Chubuk <chbgdn@gmail.com>
 Signed-off-by: naoki66 <naoki66@qq.com>
+
+[Re-applied on top of the SOE XFRM flowtable series.]
 ---
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index f096f8b..ff65ad1 100644
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -84,7 +84,7 @@ static void nft_flow_offload_eval(const
+@@ -120,7 +120,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  	bool tcp_not_established = false;
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
@@ -25,7 +29,7 @@ Signed-off-by: naoki66 <naoki66@qq.com>
  
  	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
  		goto out;
-@@ -129,8 +129,11 @@
+@@ -131,8 +131,11 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
  
  	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
  	case IPPROTO_TCP:
@@ -39,6 +43,3 @@ Signed-off-by: naoki66 <naoki66@qq.com>
  		if (unlikely(!tcph))
  			goto out;
  		if (unlikely(tcph->fin || tcph->rst))
-
--- 
-2.43.0

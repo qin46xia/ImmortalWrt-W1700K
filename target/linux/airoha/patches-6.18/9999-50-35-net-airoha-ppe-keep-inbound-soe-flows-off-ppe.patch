@@ -1,0 +1,44 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: ppe: keep inbound SOE flows off PPE by default
+
+An inbound SOE PPE entry can only match the outer ESP 3-tuple. Once bound
+it takes over every packet of the SA: other inner flows, ICMP and traffic
+addressed to the router are decrypted and sent to the next hop of the
+first offloaded flow without passing conntrack. Replies to such packets
+are ct state invalid and fw4 drops them, so the tunnel breaks for
+everything but the one flow.
+
+Keep inbound decryption on the SOE CPU path unless the soe_ppe_input
+parameter is set. Outbound entries match the inner 5-tuple and stay
+per-flow.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index cd2ff64..256f5ce 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -40,6 +40,16 @@ static int ppe_bind_rate = 0x1e;
+ module_param(ppe_bind_rate, int, 0644);
+ MODULE_PARM_DESC(ppe_bind_rate, "PPE bind threshold in packets per second (default 30)");
+ 
++/* A bound inbound SOE entry can only match the outer ESP 3-tuple, so it
++ * takes over every packet of the SA: other inner flows, ICMP and traffic
++ * for the router itself are decrypted and sent to the first flow's next
++ * hop, bypassing conntrack (replies then hit ct state invalid). Keep
++ * inbound decryption on the SOE CPU path unless explicitly enabled.
++ */
++static bool soe_ppe_input;
++module_param(soe_ppe_input, bool, 0644);
++MODULE_PARM_DESC(soe_ppe_input, "Bind inbound SOE flows in PPE (takes over the whole SA)");
++
+ static void airoha_ppe_drop_inc(struct airoha_ppe *ppe,
+ 				enum airoha_ppe_drop_reason reason)
+ {
+@@ -986,6 +996,8 @@ airoha_ppe_soe_flow_add(struct airoha_eth *eth,
+ 		return -ENOENT;
+ 	if (tuple->l3proto != NFPROTO_IPV4 || x->props.family != AF_INET)
+ 		return -EOPNOTSUPP;
++	if (dir == XFRM_DEV_OFFLOAD_IN && !READ_ONCE(soe_ppe_input))
++		return -EOPNOTSUPP;
+ 
+ 	err = airoha_soe_ppe_flow_add(eth->soe, x, dir,
+ 				      &e->soe_flow, &info->state);

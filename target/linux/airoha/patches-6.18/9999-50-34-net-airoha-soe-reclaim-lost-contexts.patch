@@ -1,0 +1,157 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: reclaim contexts SOE never completes
+
+SOE does not return a CPU completion for every tracked submit. Results of
+packets that were in flight while their flow became PPE-bound leave
+through the PPE path instead. Their contexts stayed queued forever, pinned
+the per-SA in-flight limit and kept active_ctx above zero, so the PPE bind
+barrier never drained and every later CPU-path transmit was deferred:
+
+  active=39 queued=39 bind_tx_queued=90 draining=1 bind_active=1
+
+SOE answers within microseconds. Reclaim tracked contexts still queued
+after 100 ms from a delayed work that runs while contexts are active, and
+count them in soe_state.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 8f59c5d..982c07f 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -183,6 +183,8 @@
+  * and completions are matched in submit order, which SOE preserves per SA.
+  */
+ #define AIROHA_SOE_MAX_INFLIGHT 256
++#define AIROHA_SOE_REAP_TIMEOUT msecs_to_jiffies(100)
++#define AIROHA_SOE_REAP_INTERVAL msecs_to_jiffies(100)
+ static unsigned int soe_max_inflight = 64;
+ module_param(soe_max_inflight, uint, 0644);
+ MODULE_PARM_DESC(soe_max_inflight, "Max tracked SOE contexts in flight per SA");
+@@ -207,6 +209,7 @@ enum airoha_soe_ctx_dir {
+ struct airoha_soe_ctx {
+ 	struct list_head list;
+ 	struct sk_buff *metadata;
++	unsigned long submit_jiffies;
+ 	enum airoha_soe_ctx_dir dir;
+ 	u8 completion_tag;
+ 	union {
+@@ -312,6 +315,8 @@ struct airoha_soe {
+ 	struct work_struct seq_work;
+ 	struct work_struct policy_work;
+ 	struct work_struct bind_tx_work;
++	struct delayed_work reap_work;
++	atomic_t reaped;
+ 	struct list_head ppe_flows;
+ 	struct list_head bind_tx_queue;
+ 
+@@ -362,8 +367,9 @@ static int airoha_soe_state_get(char *buf, const struct kernel_param *kp)
+ 
+ 		spin_lock_irqsave(&soe->seq_lock, flags);
+ 		len += sysfs_emit_at(buf, len,
+-				     "active=%d queued=%d bind_tx_queued=%u draining=%d bind_active=%d seq_stopped=%d faulted=%d dead=%d\n",
++				     "active=%d queued=%d reaped=%d bind_tx_queued=%u draining=%d bind_active=%d seq_stopped=%d faulted=%d dead=%d\n",
+ 				     atomic_read(&soe->active_ctx),
++				     atomic_read(&soe->reaped),
+ 				     atomic_read(&soe->queued_ctx),
+ 				     soe->bind_tx_queued, soe->bind_tx_draining,
+ 				     soe->ppe_bind_active, soe->seq_stopped,
+@@ -2512,8 +2518,12 @@ __airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 				 ctx->rx.foe_valid);
+ 
+ 	if (!untracked) {
++		ctx->submit_jiffies = jiffies;
+ 		list_add_tail(&ctx->list, head);
+ 		sa->inflight++;
++		if (!delayed_work_pending(&sa->soe->reap_work))
++			schedule_delayed_work(&sa->soe->reap_work,
++					      AIROHA_SOE_REAP_INTERVAL);
+ 		atomic_inc(&sa->soe->queued_ctx);
+ 		atomic_inc(&sa->soe->active_ctx);
+ 		reinit_completion(&sa->idle);
+@@ -2604,6 +2614,63 @@ static int airoha_soe_submit_skb(struct airoha_soe_sa *sa,
+ 	return airoha_soe_submit_prepared_skb(sa, dev, skb, ctx, x, false);
+ }
+ 
++/* SOE does not return a completion for every tracked submit: results for
++ * packets that were in flight while their flow became PPE-bound leave
++ * through the PPE path instead. Such contexts would stay queued forever,
++ * pin the SA in-flight limit and block the PPE bind barrier, which then
++ * defers all later CPU-path transmits. SOE answers within microseconds, so
++ * reclaim contexts that are still queued after AIROHA_SOE_REAP_TIMEOUT.
++ */
++static unsigned int airoha_soe_reap_list(struct airoha_soe_sa *sa,
++					 struct list_head *queue,
++					 struct list_head *reaped)
++{
++	unsigned long deadline = jiffies - AIROHA_SOE_REAP_TIMEOUT;
++	struct airoha_soe_ctx *ctx, *tmp;
++	unsigned int count = 0;
++
++	list_for_each_entry_safe(ctx, tmp, queue, list) {
++		if (time_after(ctx->submit_jiffies, deadline))
++			break;
++		list_move_tail(&ctx->list, reaped);
++		atomic_dec(&sa->soe->queued_ctx);
++		count++;
++	}
++
++	return count;
++}
++
++static void airoha_soe_reap_work(struct work_struct *work)
++{
++	struct airoha_soe *soe = container_of(to_delayed_work(work),
++					      struct airoha_soe, reap_work);
++	unsigned int i, count;
++
++	rcu_read_lock();
++	for (i = 0; i < AIROHA_SOE_NUM_SA; i++) {
++		struct airoha_soe_sa *sa = rcu_dereference(soe->sa[i]);
++		LIST_HEAD(reaped);
++
++		if (!sa)
++			continue;
++
++		spin_lock_bh(&sa->lock);
++		count = airoha_soe_reap_list(sa, &sa->tx_queue, &reaped);
++		count += airoha_soe_reap_list(sa, &sa->rx_queue, &reaped);
++		spin_unlock_bh(&sa->lock);
++		if (!count)
++			continue;
++
++		atomic_add(count, &soe->reaped);
++		airoha_soe_discard_ctx_list(sa, &reaped);
++	}
++	rcu_read_unlock();
++
++	if (atomic_read(&soe->active_ctx))
++		schedule_delayed_work(&soe->reap_work,
++				      AIROHA_SOE_REAP_INTERVAL);
++}
++
+ static void airoha_soe_bind_tx_work(struct work_struct *work)
+ {
+ 	struct airoha_soe *soe =
+@@ -4018,6 +4085,7 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	INIT_WORK(&soe->seq_work, airoha_soe_seq_work);
+ 	INIT_WORK(&soe->policy_work, airoha_soe_policy_work);
+ 	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
++	INIT_DELAYED_WORK(&soe->reap_work, airoha_soe_reap_work);
+ 	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
+ 
+ 	err = airoha_soe_wipe_hw(soe);
+@@ -4094,6 +4162,7 @@ void airoha_soe_deinit(struct airoha_eth *eth)
+ 	cancel_work_sync(&soe->bind_tx_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+ 	airoha_soe_policy_unregister(soe);
++	cancel_delayed_work_sync(&soe->reap_work);
+ 
+ 	writel(0, soe->base + AIROHA_SOE_INT_EN);
+ 	synchronize_irq(soe->irq);
+@@ -4106,6 +4175,7 @@ void airoha_soe_deinit(struct airoha_eth *eth)
+ 	wait_for_completion(&soe->released);
+ 	/* State teardown can fault and reschedule this work while refs drain. */
+ 	cancel_work_sync(&soe->bind_tx_work);
++	cancel_delayed_work_sync(&soe->reap_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+ 	cancel_work_sync(&soe->error_work);
+ 	airoha_soe_cancel_seq_work(soe);

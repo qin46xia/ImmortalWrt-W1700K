@@ -1,0 +1,119 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: keep completion sequence bits zero
+
+The completion tag is written to hop descriptor byte 28, which SOE echoes
+back as the RX SW_UDF field. Bits 7:5 of that byte are not opaque to SOE
+on AN7581: with a non-zero sequence there, encrypted packets
+intermittently leave with a wrong AES-GCM ICV while the ciphertext is
+correct. Measured on a W1700K with 100 Mbit/s of UDP through one SA:
+
+  1 context in flight, sequence always 0:   0 ICV errors
+  1 context in flight, sequence rotating: 461 ICV errors
+  2..7 contexts in flight:                 456..6869 ICV errors
+
+Always submit tracked contexts with sequence 0 and match completions in
+submit order, which pop_ctx() already does when all tags are equal. Limit
+the tracked contexts per SA by count (soe_max_inflight, default 64)
+instead of by free sequence slots, which also lifts the old limit of
+seven packets in flight.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 6433f71..8f59c5d 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -175,13 +175,17 @@
+ #define AIROHA_SOE_COMPLETION_SEQ_UNTRACKED 7
+ #define AIROHA_SOE_COMPLETION_SEQ_COUNT 7
+ 
+-/* Debug knobs for isolating SOE encrypt corruption under load. */
+-static unsigned int soe_max_inflight = AIROHA_SOE_COMPLETION_SEQ_COUNT;
++/* The completion tag travels in the hop descriptor byte SOE returns as the
++ * RX SW_UDF field, but on AN7581 SOE does not treat bits 7:5 of that byte as
++ * opaque: with a non-zero sequence there, encrypt results intermittently
++ * carry a wrong AES-GCM ICV although the ciphertext is right (always with
++ * the untracked value 7). Tracked submits therefore always use sequence 0
++ * and completions are matched in submit order, which SOE preserves per SA.
++ */
++#define AIROHA_SOE_MAX_INFLIGHT 256
++static unsigned int soe_max_inflight = 64;
+ module_param(soe_max_inflight, uint, 0644);
+-MODULE_PARM_DESC(soe_max_inflight, "Max tracked SOE contexts in flight per SA (1-7)");
+-static bool soe_seq_rr;
+-module_param(soe_seq_rr, bool, 0644);
+-MODULE_PARM_DESC(soe_seq_rr, "Allocate SOE completion sequence slots round-robin");
++MODULE_PARM_DESC(soe_max_inflight, "Max tracked SOE contexts in flight per SA");
+ #define AIROHA_SOE_BIND_TX_MAX 1024
+ #define AIROHA_SOE_NATT_PORT 4500
+ 
+@@ -251,7 +255,6 @@ struct airoha_soe_sa {
+ 	struct completion idle;
+ 	unsigned int inflight;
+ 	unsigned long completion_seq_map;
+-	unsigned int last_seq;
+ 	struct airoha_soe_ppe_key ppe_key;
+ 	bool hw_cleared;
+ 	bool quarantined;
+@@ -2187,7 +2190,6 @@ airoha_soe_pop_ctx(struct airoha_soe_sa *sa, enum airoha_soe_ctx_dir dir,
+ {
+ 	struct airoha_soe_ctx *ctx, *match = NULL;
+ 	struct list_head *head;
+-	unsigned int seq;
+ 
+ 	head = dir == AIROHA_SOE_CTX_OUT ? &sa->tx_queue : &sa->rx_queue;
+ 
+@@ -2200,10 +2202,6 @@ airoha_soe_pop_ctx(struct airoha_soe_sa *sa, enum airoha_soe_ctx_dir dir,
+ 	}
+ 	if (match) {
+ 		list_del_init(&match->list);
+-		seq = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-				match->completion_tag);
+-		if (!WARN_ON_ONCE(!test_bit(seq, &sa->completion_seq_map)))
+-			__clear_bit(seq, &sa->completion_seq_map);
+ 		atomic_dec(&sa->soe->queued_ctx);
+ 	}
+ 	spin_unlock_bh(&sa->lock);
+@@ -2491,23 +2489,9 @@ __airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 	} else {
+ 		unsigned int limit = clamp_t(unsigned int,
+ 					     READ_ONCE(soe_max_inflight), 1,
+-					     AIROHA_SOE_COMPLETION_SEQ_COUNT);
+-
+-		if (hweight_long(sa->completion_seq_map) >= limit) {
+-			seq = AIROHA_SOE_COMPLETION_SEQ_COUNT;
+-		} else if (READ_ONCE(soe_seq_rr)) {
+-			seq = find_next_zero_bit(&sa->completion_seq_map,
+-						 AIROHA_SOE_COMPLETION_SEQ_COUNT,
+-						 sa->last_seq + 1);
+-			if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT)
+-				seq = find_first_zero_bit(&sa->completion_seq_map,
+-							  AIROHA_SOE_COMPLETION_SEQ_COUNT);
+-		} else {
+-			seq = find_first_zero_bit(&sa->completion_seq_map,
+-						  AIROHA_SOE_COMPLETION_SEQ_COUNT);
+-		}
+-		if (seq < AIROHA_SOE_COMPLETION_SEQ_COUNT)
+-			sa->last_seq = seq;
++					     AIROHA_SOE_MAX_INFLIGHT);
++
++		seq = sa->inflight >= limit ? AIROHA_SOE_COMPLETION_SEQ_COUNT : 0;
+ 		if (seq == AIROHA_SOE_COMPLETION_SEQ_COUNT) {
+ 			if (ctx->dir == AIROHA_SOE_CTX_OUT && !from_queue)
+ 				err = airoha_soe_defer_tx_locked(sa, dev, skb, ctx,
+@@ -2518,7 +2502,6 @@ __airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 			spin_unlock_irqrestore(&sa->soe->seq_lock, flags);
+ 			return err;
+ 		}
+-		__set_bit(seq, &sa->completion_seq_map);
+ 		ctx->completion_tag =
+ 			FIELD_PREP(AIROHA_SOE_COMPLETION_SA_MASK, sa->index) |
+ 			FIELD_PREP(AIROHA_SOE_COMPLETION_SEQ_MASK, seq);
+@@ -2540,9 +2523,6 @@ __airoha_soe_submit_prepared_skb(struct airoha_soe_sa *sa,
+ 				AIROHA_SOE_TXMSG2_DEFAULT);
+ 	if (err && !untracked) {
+ 		list_del(&ctx->list);
+-		__clear_bit(FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+-				      ctx->completion_tag),
+-			    &sa->completion_seq_map);
+ 		atomic_dec(&sa->soe->queued_ctx);
+ 		atomic_dec(&sa->soe->active_ctx);
+ 		sa->inflight--;

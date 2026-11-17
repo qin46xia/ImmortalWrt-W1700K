@@ -1,0 +1,12 @@
+diff --git a/net/sing-box/Makefile b/net/sing-box/Makefile
+index 7549839..4d33ad8 100644
+--- a/net/sing-box/Makefile
++++ b/net/sing-box/Makefile
+@@ -81,6 +81,7 @@ define Package/sing-box/config
+ 
+   config SING_BOX_BUILD_NAIVE_OUTBOUND
+   def_bool y
++  depends on PACKAGE_sing-box
+   depends on !(arc||armeb||loongarch64||mips||mips64||powerpc||TARGET_gemini)
+ endef
+ 

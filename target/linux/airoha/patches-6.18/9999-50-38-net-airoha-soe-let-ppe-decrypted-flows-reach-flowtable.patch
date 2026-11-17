@@ -1,0 +1,137 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: let PPE-decrypted flows reach the flowtable
+
+nft_flow_offload skips decrypted packets whose input offload state lacks
+XFRM_HW_FLOW_ID. Frames that PPE and SOE decrypt inline never set it,
+so no tunnelled flow was offloaded: inner packets took the slow path
+and the outbound direction never bound its PPE+SOE entry, dropping
+encryption from about 880 to 300 Mbit/s.
+
+Keep RX msg1 of the first SOE descriptor and record its FOE hash, the
+bound inbound SA entry, in the secpath like the look-aside completion
+does. The flowtable then offloads the flow, the inbound direction shares
+the bound SA entry and the outbound direction binds as before.
+---
+ drivers/net/ethernet/airoha/airoha_eth.c |  5 ++++-
+ drivers/net/ethernet/airoha/airoha_eth.h |  1 +
+ drivers/net/ethernet/airoha/airoha_soe.c | 18 +++++++++++++++---
+ drivers/net/ethernet/airoha/airoha_soe.h |  6 ++++--
+ 4 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 1d453ac..188ae13 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1432,6 +1432,7 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ 				q->skb->dev = NULL;
+ 				q->skb->ip_summed = CHECKSUM_NONE;
+ 				q->soe_rx_msg0 = msg0;
++				q->soe_rx_msg1 = msg1;
+ 				q->soe_rx_msg2 = msg2;
+ 			} else {
+ 				q->skb->dev = netdev;
+@@ -1493,10 +1494,12 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ 			u32 completion_tag =
+ 				FIELD_GET(QDMA_ETH_RXMSG_SW_UDF_MASK,
+ 					  q->soe_rx_msg2);
++			u32 foe_hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY,
++						 q->soe_rx_msg1);
+ 
+ 			done++;
+ 			if (!airoha_soe_rx_skb(eth->soe, q->skb, completion_tag,
+-					       hop_flags))
++					       hop_flags, foe_hash))
+ 				dev_kfree_skb(q->skb);
+ 			q->skb = NULL;
+ 			continue;
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index ea0d90c..5fcae85 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -237,6 +237,7 @@ struct airoha_queue {
+ 	/* First SOE descriptor metadata is kept while a scattered frame is built. */
+ 	int rx_frame_descs;
+ 	u32 soe_rx_msg0;
++	u32 soe_rx_msg1;
+ 	u32 soe_rx_msg2;
+ 
+ 	struct list_head tx_list;
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 3ff225a..3c54920 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -3230,7 +3230,7 @@ drop:
+  * and the inbound policy check see every inner flow.
+  */
+ static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
+-				 unsigned int sa_index)
++				 unsigned int sa_index, u32 foe_hash)
+ {
+ 	struct net_device *netdev;
+ 	struct airoha_soe_sa *sa;
+@@ -3289,8 +3289,18 @@ static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
+ 	sp = secpath_set(skb);
+ 	if (!sp || sp->len >= XFRM_MAX_DEPTH)
+ 		goto put_state;
++	/* Like a look-aside completion, record the transform without raising
++	 * olen so the inbound policy check still runs, and carry the FOE hash
++	 * of the bound SA entry: nft_flow_offload skips decrypted packets
++	 * without it, which would keep every tunnelled flow (and its outbound
++	 * direction) out of the flowtable.
++	 */
+ 	xo = &sp->ovec[0];
+ 	xo->flags = 0;
++	if (foe_hash != AIROHA_RXD4_FOE_ENTRY) {
++		xo->hw_flow_id = foe_hash;
++		xo->flags |= XFRM_HW_FLOW_ID;
++	}
+ 	sp->xvec[sp->len++] = x;
+ 
+ 	nf_reset_ct(skb);
+@@ -3307,7 +3317,8 @@ drop:
+ }
+ 
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+-		       unsigned int completion_tag, u32 hop_flags)
++		       unsigned int completion_tag, u32 hop_flags,
++		       u32 foe_hash)
+ {
+ 	enum airoha_soe_ctx_dir dir;
+ 	struct airoha_soe_ctx *ctx;
+@@ -3322,7 +3333,8 @@ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 	if (hop_flags == AIROHA_SOE_HOP_FLAG_DECRYPTED &&
+ 	    (skb_headlen(skb) < ETH_HLEN ||
+ 	     !airoha_soe_is_submit_header(skb->data)))
+-		return airoha_soe_rx_ppe_in(soe, skb, completion_tag & 0x3f);
++		return airoha_soe_rx_ppe_in(soe, skb, completion_tag & 0x3f,
++					    foe_hash);
+ 	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
+ 	untracked = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+ 			      completion_tag) ==
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 56d6cc5..4543fab 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -83,7 +83,8 @@ void airoha_soe_teardown_netdev(struct net_device *dev);
+ int airoha_soe_set_features(struct net_device *dev, netdev_features_t features);
+ bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0);
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+-		       unsigned int completion_tag, u32 hop_flags);
++		       unsigned int completion_tag, u32 hop_flags,
++		       u32 foe_hash);
+ bool airoha_soe_rx_drop(struct airoha_soe *soe,
+ 			unsigned int completion_tag);
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -160,7 +161,8 @@ static inline bool airoha_soe_rx_is_completion(const void *data, size_t len,
+ 
+ static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
+ 				     struct sk_buff *skb,
+-				     unsigned int completion_tag, u32 hop_flags)
++				     unsigned int completion_tag, u32 hop_flags,
++				     u32 foe_hash)
+ {
+ 	return false;
+ }
+-- 
+2.43.0
+

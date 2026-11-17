@@ -1,0 +1,25 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: hash decrypted packets by inner flow
+
+airoha_soe_restore_metadata() copies the header of the original ESP skb,
+including its flow hash. Every decrypted packet of an SA then carries the
+same outer-flow hash and RPS steers all of them to one CPU, which caps
+inbound IPsec at one core. Clear the hash before netif_rx() so RPS hashes
+the inner flow.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 982c07f..eb7fece 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -3146,6 +3146,11 @@ static bool airoha_soe_complete_in(struct sk_buff *skb,
+ 
+ 	nf_reset_ct(skb);
+ 	kfree(ctx);
++	/* The header copied from the ESP skb carries the outer flow hash,
++	 * which is the same for every packet of the SA. Let RPS hash the
++	 * decrypted inner flow instead so tunnelled flows spread over CPUs.
++	 */
++	skb_clear_hash(skb);
+ 	netif_rx(skb);
+ 
+ 	return true;

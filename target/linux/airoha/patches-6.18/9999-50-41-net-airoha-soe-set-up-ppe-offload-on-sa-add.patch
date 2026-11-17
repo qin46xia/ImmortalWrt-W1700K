@@ -1,0 +1,121 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: set up PPE offload when an SA is added
+
+The PPE is configured lazily, on the first flowtable offload request. A
+tunnelled connection only reaches the flowtable once its decrypted
+packets carry a PPE flow id, and that needs the inbound SA bound to the
+PPE, which in turn needs the PPE configured. When every forwarded flow
+goes through the tunnel nothing else ever offloads a flow first, so the
+tunnel stayed on the CPU submit path (about 250 Mbit/s instead of line
+rate) until reboot.
+
+Configure the PPE from a work item when a packet offload SA is added and
+the PPE is not set up yet.
+---
+ drivers/net/ethernet/airoha/airoha_eth.h |  1 +
+ drivers/net/ethernet/airoha/airoha_ppe.c | 21 +++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_soe.c | 16 ++++++++++++++++
+ 3 files changed, 38 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 5fcae85..f9d4f6f 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -917,6 +917,7 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data,
+ 				 bool is_flowtable);
+ int airoha_ppe_init(struct airoha_eth *eth);
++int airoha_ppe_offload_prepare(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 0735206..f1ce825 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3583,6 +3583,27 @@ error_npu_put:
+ 	return err;
+ }
+ 
++/* Bring up PPE offload ahead of the first flowtable rule. An SOE SA can
++ * only bind to PPE once the PPE is configured, while the flowtable only
++ * offloads tunnelled connections whose decrypted packets carry a PPE flow
++ * id. Without other offloaded traffic to initialize the PPE first, tunnel
++ * flows would stay on the slow path for good.
++ */
++int airoha_ppe_offload_prepare(struct airoha_eth *eth)
++{
++	int err = 0;
++
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++		return -EBUSY;
++
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu)
++		err = airoha_ppe_offload_setup(eth);
++	mutex_unlock(&flow_offload_mutex);
++
++	return err;
++}
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data,
+ 				 bool is_flowtable)
+ {
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index ea6ff40..696e03a 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -315,6 +315,7 @@ struct airoha_soe {
+ 	struct work_struct seq_work;
+ 	struct work_struct policy_work;
+ 	struct work_struct bind_tx_work;
++	struct work_struct ppe_setup_work;
+ 	struct delayed_work reap_work;
+ 	atomic_t reaped;
+ 	struct list_head ppe_flows;
+@@ -2682,6 +2683,17 @@ static void airoha_soe_reap_work(struct work_struct *work)
+ 				      AIROHA_SOE_REAP_INTERVAL);
+ }
+ 
++static void airoha_soe_ppe_setup_work(struct work_struct *work)
++{
++	struct airoha_soe *soe = container_of(work, struct airoha_soe,
++					      ppe_setup_work);
++	int err;
++
++	err = airoha_ppe_offload_prepare(soe->eth);
++	if (err)
++		dev_warn(soe->dev, "PPE offload setup failed: %d\n", err);
++}
++
+ static void airoha_soe_bind_tx_work(struct work_struct *work)
+ {
+ 	struct airoha_soe *soe =
+@@ -3566,6 +3578,8 @@ static int airoha_soe_xfrm_state_add(struct net_device *dev,
+ 
+ 	atomic_inc(&gdm_dev->soe_xfrm_state_count);
+ 	state->counted = true;
++	if (!rcu_access_pointer(gdm_dev->eth->npu))
++		schedule_work(&soe->ppe_setup_work);
+ out:
+ 	x->xso.offload_handle = (unsigned long)state;
+ 	return 0;
+@@ -4213,6 +4227,7 @@ int airoha_soe_init(struct airoha_eth *eth)
+ 	INIT_WORK(&soe->seq_work, airoha_soe_seq_work);
+ 	INIT_WORK(&soe->policy_work, airoha_soe_policy_work);
+ 	INIT_WORK(&soe->bind_tx_work, airoha_soe_bind_tx_work);
++	INIT_WORK(&soe->ppe_setup_work, airoha_soe_ppe_setup_work);
+ 	INIT_DELAYED_WORK(&soe->reap_work, airoha_soe_reap_work);
+ 	soe->netdev_nb.notifier_call = airoha_soe_netdev_event;
+ 
+@@ -4288,6 +4303,7 @@ void airoha_soe_deinit(struct airoha_eth *eth)
+ 	soe->dead = true;
+ 	spin_unlock_irqrestore(&soe->state_lock, flags);
+ 	cancel_work_sync(&soe->bind_tx_work);
++	cancel_work_sync(&soe->ppe_setup_work);
+ 	airoha_soe_purge_bind_tx(soe, NULL);
+ 	airoha_soe_policy_unregister(soe);
+ 	cancel_delayed_work_sync(&soe->reap_work);
+-- 
+2.43.0
+

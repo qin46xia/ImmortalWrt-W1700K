@@ -1,0 +1,37 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: ppe: relearn aged SOE entries
+
+The PPE ages an idle SOE entry back to UNBIND, but its flow keeps the
+bound flag and airoha_soe_ppe_flow_bind_start() rejects bound flows, so
+the entry was held unbound from then on. After a pause longer than the
+bind age the whole SA (decrypt) or connection (encrypt) stayed on the
+look-aside path, at about 220 Mbit/s.
+
+Clear the stale binding when an unbound entry is learned again so it is
+rebound through the normal completion barrier.
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 429576e..0735206 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2332,6 +2332,14 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 	}
+ 	if (hwe_bound && !soe_entry)
+ 		goto unlock;
++	/* The hardware ages an idle SOE entry back to UNBIND while its flow
++	 * still counts as bound, and bind_start() refuses a bound flow. That
++	 * left the SA (and every flow sharing it) on the slow path for good
++	 * once traffic paused for the bind age. Forget the stale binding so
++	 * the entry is learned again through the normal completion barrier.
++	 */
++	if (!hwe_bound && soe_entry)
++		airoha_soe_ppe_flow_unbind(&soe_entry->soe_flow);
+ 
+ 	hlist_for_each_entry_safe(e, n, &ppe->foe_flow[index], list) {
+ 		bool bind_started = false;
+-- 
+2.43.0
+

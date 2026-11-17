@@ -1,0 +1,118 @@
+From: qin46xia
+Subject: [PATCH] net: airoha: soe: GRO PPE-decrypted packets
+
+PPE-decrypted frames were passed to netif_receive_skb() one by one, so
+the CPU that RPS picks for a tunnelled TCP flow forwards every MTU-sized
+packet and caps a single flow at about 470 Mbit/s while other CPUs idle.
+
+Feed them to the RX NAPI instance through napi_gro_receive() instead.
+The forwarding CPU then handles merged segments and the egress port's
+TSO splits them again. Mark the plaintext CHECKSUM_UNNECESSARY as the
+SA ICV already authenticates it (as WireGuard does), so GRO does not
+checksum every payload in software.
+---
+ drivers/net/ethernet/airoha/airoha_eth.c |  2 +-
+ drivers/net/ethernet/airoha/airoha_soe.c | 23 ++++++++++++++++++-----
+ drivers/net/ethernet/airoha/airoha_soe.h |  4 ++--
+ 3 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 188ae13..ffc2ab3 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1499,7 +1499,7 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget,
+ 
+ 			done++;
+ 			if (!airoha_soe_rx_skb(eth->soe, q->skb, completion_tag,
+-					       hop_flags, foe_hash))
++					       hop_flags, foe_hash, &q->napi))
+ 				dev_kfree_skb(q->skb);
+ 			q->skb = NULL;
+ 			continue;
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.c b/drivers/net/ethernet/airoha/airoha_soe.c
+index 3c54920..ea6ff40 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.c
++++ b/drivers/net/ethernet/airoha/airoha_soe.c
+@@ -3230,7 +3230,8 @@ drop:
+  * and the inbound policy check see every inner flow.
+  */
+ static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
+-				 unsigned int sa_index, u32 foe_hash)
++				 unsigned int sa_index, u32 foe_hash,
++				 struct napi_struct *napi)
+ {
+ 	struct net_device *netdev;
+ 	struct airoha_soe_sa *sa;
+@@ -3270,7 +3271,12 @@ static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
+ 	if (err)
+ 		goto put_state;
+ 
+-	skb->ip_summed = CHECKSUM_NONE;
++	/* The plaintext is authenticated by the SA ICV, so the inner checksums
++	 * need no further verification, as for WireGuard. This also lets GRO
++	 * merge the decrypted TCP stream without checksumming every payload.
++	 */
++	skb->ip_summed = CHECKSUM_UNNECESSARY;
++	skb->csum_level = ~0;
+ 	skb->encapsulation = 0;
+ 	skb->mark = xfrm_smark_get(skb->mark, x);
+ 
+@@ -3305,7 +3311,14 @@ static bool airoha_soe_rx_ppe_in(struct airoha_soe *soe, struct sk_buff *skb,
+ 
+ 	nf_reset_ct(skb);
+ 	skb_clear_hash(skb);
+-	netif_receive_skb(skb);
++	/* Aggregate the decrypted stream before RPS hands it to the
++	 * forwarding CPU: one GRO segment replaces up to 45 forwarded packets
++	 * and leaves segmentation to the egress TSO.
++	 */
++	if (napi)
++		napi_gro_receive(napi, skb);
++	else
++		netif_receive_skb(skb);
+ 
+ 	return true;
+ 
+@@ -3318,7 +3331,7 @@ drop:
+ 
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 		       unsigned int completion_tag, u32 hop_flags,
+-		       u32 foe_hash)
++		       u32 foe_hash, struct napi_struct *napi)
+ {
+ 	enum airoha_soe_ctx_dir dir;
+ 	struct airoha_soe_ctx *ctx;
+@@ -3334,7 +3347,7 @@ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 	    (skb_headlen(skb) < ETH_HLEN ||
+ 	     !airoha_soe_is_submit_header(skb->data)))
+ 		return airoha_soe_rx_ppe_in(soe, skb, completion_tag & 0x3f,
+-					    foe_hash);
++					    foe_hash, napi);
+ 	sa_index = FIELD_GET(AIROHA_SOE_COMPLETION_SA_MASK, completion_tag);
+ 	untracked = FIELD_GET(AIROHA_SOE_COMPLETION_SEQ_MASK,
+ 			      completion_tag) ==
+diff --git a/drivers/net/ethernet/airoha/airoha_soe.h b/drivers/net/ethernet/airoha/airoha_soe.h
+index 4543fab..aec7fa7 100644
+--- a/drivers/net/ethernet/airoha/airoha_soe.h
++++ b/drivers/net/ethernet/airoha/airoha_soe.h
+@@ -84,7 +84,7 @@ int airoha_soe_set_features(struct net_device *dev, netdev_features_t features);
+ bool airoha_soe_rx_is_completion(const void *data, size_t len, u32 msg0);
+ bool airoha_soe_rx_skb(struct airoha_soe *soe, struct sk_buff *skb,
+ 		       unsigned int completion_tag, u32 hop_flags,
+-		       u32 foe_hash);
++		       u32 foe_hash, struct napi_struct *napi);
+ bool airoha_soe_rx_drop(struct airoha_soe *soe,
+ 			unsigned int completion_tag);
+ bool airoha_soe_rx_plain_skb(struct airoha_gdm_dev *dev, struct sk_buff *skb,
+@@ -162,7 +162,7 @@ static inline bool airoha_soe_rx_is_completion(const void *data, size_t len,
+ static inline bool airoha_soe_rx_skb(struct airoha_soe *soe,
+ 				     struct sk_buff *skb,
+ 				     unsigned int completion_tag, u32 hop_flags,
+-				     u32 foe_hash)
++				     u32 foe_hash, struct napi_struct *napi)
+ {
+ 	return false;
+ }
+-- 
+2.43.0
+
