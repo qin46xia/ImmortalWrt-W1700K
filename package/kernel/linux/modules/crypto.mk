@@ -346,6 +346,40 @@ KernelPackage/crypto-ghash/mvebu/cortexa9=$(KernelPackage/crypto-ghash/arm-ce)
 $(eval $(call KernelPackage,crypto-ghash))
 
 
+define KernelPackage/crypto-ghash-arm64
+  TITLE:=ARM64 NEON GHASH and Crypto Extensions GCM
+  DEPENDS:=@aarch64 +kmod-crypto-ghash +kmod-crypto-aead
+  KCONFIG:=CONFIG_CRYPTO_GHASH_ARM64_CE CONFIG_CRYPTO_LIB_AES=y
+  FILES:=$(LINUX_DIR)/arch/arm64/crypto/ghash-ce.ko
+  AUTOLOAD:=$(call AutoLoad,09,ghash-ce)
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-ghash-arm64/description
+  ARM64 GHASH using NEON on CPUs without PMULL, or fused AES-GCM on
+  CPUs with PMULL. Supplies ghash-ce.ko.
+endef
+
+$(eval $(call KernelPackage,crypto-ghash-arm64))
+
+
+define KernelPackage/crypto-aes-arm64-neon
+  TITLE:=ARM64 NEON AES (ECB/CBC/CTR/XTS)
+  DEPENDS:=@aarch64
+  KCONFIG:=CONFIG_CRYPTO_AES_ARM64_NEON_BLK CONFIG_CRYPTO_LIB_AES=y
+  FILES:=$(LINUX_DIR)/arch/arm64/crypto/aes-neon-blk.ko
+  AUTOLOAD:=$(call AutoLoad,09,aes-neon-blk)
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-aes-arm64-neon/description
+  AES block modes using NEON, for ARM64 CPUs without the AES
+  Crypto Extensions (e.g. Airoha AN7581).
+endef
+
+$(eval $(call KernelPackage,crypto-aes-arm64-neon))
+
+
 define KernelPackage/crypto-hash
   TITLE:=CryptoAPI hash support
   KCONFIG:=CONFIG_CRYPTO_HASH
