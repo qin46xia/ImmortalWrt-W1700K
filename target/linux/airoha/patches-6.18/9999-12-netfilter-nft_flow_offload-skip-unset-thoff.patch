@@ -8,16 +8,16 @@ transport header offset is only valid after nftables has evaluated meta
 or another payload expression. Without that, nft_thoff() still returns
 zero and skb_header_pointer() would read from the Ethernet header.
 
-Adapted from openwrt-pon 675-09 for the XR1710G tree, where 9999-11
-extends the same TCP validation block for XFRM/SOE flows.
+Adapted from openwrt-pon 675-09 for the XR1710G tree, rebased onto
+the unmodified TCP validation block (no XFRM/SOE flow patch).
 
 Signed-off-by: Bohdan Chubuk <chbgdn@gmail.com>
 Signed-off-by: naoki66 <naoki66@qq.com>
 ---
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -84,7 +84,7 @@ static void nft_flow_offload_eval(const
- 	bool tcp_not_established = false;
+@@ -97,7 +97,7 @@
+ 	struct flow_offload *flow;
  	enum ip_conntrack_dir dir;
  	struct nf_conn *ct;
 -	int ret;
@@ -25,7 +25,7 @@ Signed-off-by: naoki66 <naoki66@qq.com>
  
  	if (nft_flow_offload_skip(pkt->skb, nft_pf(pkt)))
  		goto out;
-@@ -129,8 +129,11 @@
+@@ -108,8 +108,11 @@
  
  	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
  	case IPPROTO_TCP:
@@ -36,9 +36,6 @@ Signed-off-by: naoki66 <naoki66@qq.com>
 +			goto out;
 +		tcph = skb_header_pointer(pkt->skb, thoff, sizeof(_tcph),
 +					  &_tcph);
- 		if (unlikely(!tcph))
+ 		if (unlikely(!tcph || tcph->fin || tcph->rst ||
+ 			     !nf_conntrack_tcp_established(ct)))
  			goto out;
- 		if (unlikely(tcph->fin || tcph->rst))
-
--- 
-2.43.0
